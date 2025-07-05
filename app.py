@@ -17,6 +17,9 @@ from datetime import datetime
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 import traceback
+from collections import defaultdict
+from time import time
+import gzip
 
 # Add src to path
 sys.path.append(str(Path(__file__).parent / "src"))
@@ -44,9 +47,9 @@ app.config['TEMPLATES_AUTO_RELOAD'] = False  # Disable template auto-reload in p
 app.config['JSON_SORT_KEYS'] = False  # Faster JSON serialization
 
 CORS(app, 
-     origins=['*'],  # Configure specific origins for production
-     methods=['GET', 'POST', 'DELETE'],
-     allow_headers=['Content-Type', 'Authorization'],
+     origins=['http://localhost:5000', 'http://127.0.0.1:5000'],  # Restrict to specific origins
+     methods=['GET', 'POST'],  # Only allow necessary methods
+     allow_headers=['Content-Type'],  # Restrict headers
      max_age=3600)  # Cache preflight requests for 1 hour
 
 # Configuration with security considerations
@@ -74,19 +77,24 @@ def get_processor():
     return processor
 
 def secure_save_file(file, upload_folder):
-    """Efficiently save uploaded file with security checks"""
+    """Efficiently save uploaded file with enhanced security checks"""
     filename = secure_filename(file.filename)
     if not filename:
         raise ValueError("Invalid filename")
     
-    # Use timestamp prefix to avoid collisions
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{timestamp}_{filename}"
+    # Generate secure filename to prevent attacks
+    filename = generate_secure_filename(file.filename)
     file_path = Path(upload_folder) / filename
     
     # Stream save for large files
     try:
         file.save(str(file_path))
+        
+        # Validate file content after saving
+        if not validate_pdf_content(file_path):
+            file_path.unlink()  # Remove invalid file
+            raise ValueError("Invalid PDF file content")
+            
         return str(file_path)
     except Exception as e:
         if file_path.exists():
@@ -146,10 +154,63 @@ def handle_payload_too_large(e):
     """Handle payload too large"""
     return handle_error("Request payload too large.", 413)
 
+@app.errorhandler(429)
+def handle_rate_limit_exceeded(e):
+    """Handle rate limit exceeded"""
+    return handle_error("Rate limit exceeded. Please wait before making more requests.", 429)
+
 @app.errorhandler(500)
 def handle_internal_error(e):
     """Handle internal server errors"""
     return handle_error("Internal server error occurred.", 500, str(e))
+
+# Rate limiting configuration
+request_counts = defaultdict(list)
+
+def rate_limit_check(key, limit=10, window=60):
+    """Simple rate limiting: limit requests per window (seconds)"""
+    now = time()
+    # Clean old requests
+    request_counts[key] = [req_time for req_time in request_counts[key] if now - req_time < window]
+    
+    if len(request_counts[key]) >= limit:
+        return False
+    
+    request_counts[key].append(now)
+    return True
+
+def get_client_id():
+    """Get client identifier for rate limiting"""
+    return request.remote_addr
+
+# Add response compression
+def compress_response(response):
+    """Compress JSON responses for better performance"""
+    if (response.content_type and 
+        'application/json' in response.content_type and 
+        len(response.data) > 500):  # Only compress larger responses
+        
+        compressed_data = gzip.compress(response.data)
+        if len(compressed_data) < len(response.data):
+            response.data = compressed_data
+            response.headers['Content-Encoding'] = 'gzip'
+            response.headers['Content-Length'] = len(compressed_data)
+    
+    return response
+
+@app.after_request
+def after_request(response):
+    """Add security headers and compression"""
+    # Security headers
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    
+    # Compress response if applicable
+    if 'gzip' in request.headers.get('Accept-Encoding', ''):
+        response = compress_response(response)
+    
+    return response
 
 # API Routes
 @app.route('/')
@@ -181,8 +242,13 @@ def health_check():
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
-    """Handle single file upload and processing"""
+    """Handle single file upload and processing with rate limiting"""
     try:
+        # Rate limiting check
+        client_id = get_client_id()
+        if not rate_limit_check(client_id, limit=10, window=60):  # 10 uploads per minute
+            return handle_error("Rate limit exceeded. Please wait before uploading again.", 429)
+        
         proc = get_processor()
         
         if 'file' not in request.files:
@@ -195,12 +261,21 @@ def upload_file():
         if not allowed_file(file.filename):
             return handle_error("Invalid file type. Only PDF files are allowed.", 400)
         
+        # Rate limiting check
+        client_id = get_client_id()
+        if not rate_limit_check(client_id):
+            return handle_error("Too many requests. Please try again later.", 429)
+        
         # Get processing options
         use_ocr = request.form.get('use_ocr', 'false').lower() == 'true'
         
         # Save uploaded file efficiently
         file_path = secure_save_file(file, app.config['UPLOAD_FOLDER'])
         logger.info(f"File uploaded: {file.filename}")
+        
+        # Validate PDF content
+        if not validate_pdf_content(file_path):
+            return handle_error("Uploaded file is not a valid PDF", 400)
         
         # Process the file
         result = proc.process_file(file_path, use_ocr=use_ocr)
@@ -256,8 +331,13 @@ def upload_file():
 
 @app.route('/api/batch-upload', methods=['POST'])
 def batch_upload():
-    """Handle multiple file upload and processing"""
+    """Handle multiple file upload and processing with rate limiting"""
     try:
+        # Rate limiting check
+        client_id = get_client_id()
+        if not rate_limit_check(client_id, limit=3, window=60):  # 3 batch uploads per minute
+            return handle_error("Rate limit exceeded. Please wait before batch uploading again.", 429)
+        
         proc = get_processor()
         
         if 'files' not in request.files:
@@ -447,6 +527,30 @@ def download_all():
     
     except Exception as e:
         return handle_error("ZIP download failed", 500, e)
+
+def validate_pdf_content(file_path):
+    """Validate that uploaded file is actually a PDF by checking magic bytes"""
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(8)
+            # Check for PDF magic bytes
+            if header.startswith(b'%PDF-'):
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"Error validating file content: {e}")
+        return False
+
+def generate_secure_filename(original_filename):
+    """Generate secure filename to prevent directory traversal"""
+    import secrets
+    # Generate secure random string
+    secure_suffix = secrets.token_hex(8)
+    base_name = secure_filename(Path(original_filename).stem)
+    # Limit base name length
+    base_name = base_name[:50] if len(base_name) > 50 else base_name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{timestamp}_{secure_suffix}_{base_name}.pdf"
 
 if __name__ == '__main__':
     try:

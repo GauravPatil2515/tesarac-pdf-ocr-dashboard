@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Download Test</title>
+</head>
+<body>
+    <h1>Download Test</h1>
+    <button onclick="testDownload()">Test Download</button>
+    
+    <script>
+        async function testDownload() {
+            const filename = 'MAT-US-ELA-00597-v2_SFMC_email_Treatment_Algorithm_Ver_0.04_20250704_201444.txt';
+            
+            try {
+                const response = await fetch(`http://localhost:5000/api/download/${filename}`);
+                
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = filename;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    console.log('Download started successfully');
+                } else {
+                    console.error('Download failed - file not found');
+                }
+            } catch (error) {
+                console.error(`Download error: ${error.message}`);
+            }
+        }
+    </script>
+</body>
+</html>

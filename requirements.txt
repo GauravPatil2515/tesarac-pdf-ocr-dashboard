@@ -13,6 +13,9 @@ Flask>=2.3.0
 Flask-CORS>=4.0.0
 Werkzeug>=2.3.0
 
+# Security & Performance
+python-magic>=0.4.27  # File type validation
+
 # Data Processing
 pandas>=2.0.0
 

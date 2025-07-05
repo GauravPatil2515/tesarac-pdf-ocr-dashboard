@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Frontend Queue Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        .file-item { border: 1px solid #ccc; padding: 10px; margin: 10px 0; }
+        .btn { padding: 8px 12px; margin: 5px; cursor: pointer; }
+        .btn-primary { background: #007bff; color: white; border: none; }
+        .btn-success { background: #28a745; color: white; border: none; }
+        .progress-bar { width: 100%; height: 20px; background: #f0f0f0; margin: 5px 0; }
+        .progress-fill { height: 100%; background: #007bff; transition: width 0.3s; }
+        .status-badge { padding: 2px 8px; border-radius: 3px; color: white; }
+        .status-badge.pending { background: #6c757d; }
+        .status-badge.processing { background: #ffc107; color: black; }
+        .status-badge.completed { background: #28a745; }
+        .status-badge.failed { background: #dc3545; }
+    </style>
+</head>
+<body>
+    <h1>Frontend Queue Download Test</h1>
+    <div id="file-queue"></div>
+    
+    <script>
+        // Minimal dashboard implementation for testing
+        class TestDashboard {
+            constructor() {
+                this.uploadQueue = [];
+                this.results = [];
+            }
+            
+            simulateFileUpload() {
+                const fileObj = {
+                    id: Date.now() + Math.random(),
+                    name: 'MAT-US-ELA-00597-v2_SFMC_email_Treatment_Algorithm_Ver_0.04.pdf',
+                    size: 1024 * 1024, // 1MB
+                    status: 'pending',
+                    progress: 0,
+                    result: null
+                };
+                
+                this.uploadQueue.push(fileObj);
+                this.updateQueueDisplay();
+                return fileObj;
+            }
+            
+            async processFile(fileId) {
+                const file = this.uploadQueue.find(f => f.id === fileId);
+                if (!file) return;
+
+                file.status = 'processing';
+                file.progress = 0;
+                this.updateQueueDisplay();
+
+                try {
+                    // Simulate processing with real API call
+                    const formData = new FormData();
+                    
+                    // Create a dummy file for testing
+                    const response = await fetch('/api/files');
+                    const filesResult = await response.json();
+                    
+                    if (filesResult.success && filesResult.files.length > 0) {
+                        // Simulate successful processing
+                        file.status = 'completed';
+                        file.progress = 100;
+                        file.result = {
+                            output_filename: filesResult.files[0].filename, // Use an existing file
+                            filename: file.name,
+                            success: true
+                        };
+                        this.showNotification(`Successfully processed ${file.name}`, 'success');
+                    } else {
+                        file.status = 'failed';
+                        file.progress = 0;
+                        file.error = 'No files available';
+                        this.showNotification(`Failed to process ${file.name}`, 'error');
+                    }
+
+                } catch (error) {
+                    file.status = 'failed';
+                    file.progress = 0;
+                    file.error = error.message;
+                    this.showNotification(`Error processing ${file.name}: ${error.message}`, 'error');
+                } finally {
+                    this.updateQueueDisplay();
+                }
+            }
+            
+            async downloadResult(fileId) {
+                const file = this.uploadQueue.find(f => f.id === fileId) || 
+                            this.results.find(r => r.id === fileId);
+                
+                if (!file) {
+                    this.showNotification('File not found in queue or results', 'warning');
+                    return;
+                }
+
+                // If file has a result with output_filename, use that
+                let filename = null;
+                if (file.result && file.result.output_filename) {
+                    filename = file.result.output_filename;
+                } else if (file.result && file.result.filename) {
+                    // Convert input filename to output filename
+                    const baseName = file.result.filename.replace('.pdf', '');
+                    // Look for the most recent output file with this base name
+                    try {
+                        const response = await fetch('/api/files');
+                        const result = await response.json();
+                        if (result.success && result.files) {
+                            // Find matching output file
+                            const outputFile = result.files.find(f => 
+                                f.filename.includes(file.name.replace('.pdf', '')) ||
+                                f.filename.includes(baseName.split('_').pop().replace('.pdf', ''))
+                            );
+                            if (outputFile) {
+                                filename = outputFile.filename;
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('Could not fetch file list:', e);
+                    }
+                }
+                
+                // Fallback to generating expected filename
+                if (!filename) {
+                    const baseName = file.name.replace('.pdf', '');
+                    filename = `${baseName}.txt`;
+                }
+
+                if (!filename) {
+                    this.showNotification('No output file available for download', 'warning');
+                    return;
+                }
+
+                try {
+                    const response = await fetch(`/api/download/${encodeURIComponent(filename)}`);
+                    
+                    if (response.ok) {
+                        const blob = await response.blob();
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = filename;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                        this.showNotification(`Downloaded: ${filename}`, 'success');
+                    } else {
+                        const errorText = await response.text();
+                        this.showNotification(`Download failed: ${response.status} - ${errorText}`, 'error');
+                    }
+                } catch (error) {
+                    this.showNotification(`Download error: ${error.message}`, 'error');
+                }
+            }
+            
+            updateQueueDisplay() {
+                const container = document.getElementById('file-queue');
+                container.innerHTML = this.uploadQueue.map(file => `
+                    <div class="file-item">
+                        <div><strong>${file.name}</strong></div>
+                        <div>Status: <span class="status-badge ${file.status}">${file.status}</span></div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" style="width: ${file.progress}%"></div>
+                        </div>
+                        <div>
+                            ${file.status === 'pending' ? `
+                                <button class="btn btn-primary" onclick="dashboard.processFile('${file.id}')">Process</button>
+                            ` : ''}
+                            ${file.status === 'completed' ? `
+                                <button class="btn btn-success" onclick="dashboard.downloadResult('${file.id}')">Download</button>
+                            ` : ''}
+                        </div>
+                        ${file.error ? `<div style="color: red;">Error: ${file.error}</div>` : ''}
+                        ${file.result ? `<div style="color: green;">Result: ${JSON.stringify(file.result)}</div>` : ''}
+                    </div>
+                `).join('');
+            }
+            
+            showNotification(message, type = 'info') {
+                alert(`${type.toUpperCase()}: ${message}`);
+            }
+        }
+        
+        const dashboard = new TestDashboard();
+        
+        // Add initial test file
+        dashboard.simulateFileUpload();
+    </script>
+</body>
+</html>
