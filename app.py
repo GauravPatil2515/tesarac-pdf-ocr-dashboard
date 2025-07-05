@@ -22,22 +22,32 @@ import traceback
 sys.path.append(str(Path(__file__).parent / "src"))
 from pdf_processor import PDFProcessor, PDFProcessorError, SystemDependencyError
 
-# Configure comprehensive logging
+# Configure optimized logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.WARNING,  # Reduced logging for production
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('api.log'),
+        logging.FileHandler('api.log', delay=True),  # Lazy file creation
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app
+# Initialize Flask app with optimizations
 app = Flask(__name__, 
             template_folder='templates',
             static_folder='static')
-CORS(app)
+
+# Performance optimizations
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 31536000  # 1 year cache for static files
+app.config['TEMPLATES_AUTO_RELOAD'] = False  # Disable template auto-reload in production
+app.config['JSON_SORT_KEYS'] = False  # Faster JSON serialization
+
+CORS(app, 
+     origins=['*'],  # Configure specific origins for production
+     methods=['GET', 'POST', 'DELETE'],
+     allow_headers=['Content-Type', 'Authorization'],
+     max_age=3600)  # Cache preflight requests for 1 hour
 
 # Configuration with security considerations
 app.config.update(
@@ -48,30 +58,40 @@ app.config.update(
     SECRET_KEY=os.environ.get('SECRET_KEY', 'dev-key-change-in-production')
 )
 
-# Global processor instance
+# Global processor instance (lazy-loaded for performance)
 processor = None
 
-def init_processor():
-    """Initialize the PDF processor with error handling"""
+def get_processor():
+    """Get processor instance with lazy initialization"""
     global processor
-    try:
-        if processor is None:
+    if processor is None:
+        try:
             processor = PDFProcessor()
-            logger.info("PDF Processor initialized successfully")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to initialize PDF processor: {e}")
-        return False
+            logger.info("PDF Processor initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize PDF processor: {e}")
+            raise
+    return processor
 
-def ensure_directories():
-    """Ensure upload and output directories exist"""
+def secure_save_file(file, upload_folder):
+    """Efficiently save uploaded file with security checks"""
+    filename = secure_filename(file.filename)
+    if not filename:
+        raise ValueError("Invalid filename")
+    
+    # Use timestamp prefix to avoid collisions
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{timestamp}_{filename}"
+    file_path = Path(upload_folder) / filename
+    
+    # Stream save for large files
     try:
-        Path(app.config['UPLOAD_FOLDER']).mkdir(exist_ok=True)
-        Path(app.config['OUTPUT_FOLDER']).mkdir(exist_ok=True)
-        return True
+        file.save(str(file_path))
+        return str(file_path)
     except Exception as e:
-        logger.error(f"Failed to create directories: {e}")
-        return False
+        if file_path.exists():
+            file_path.unlink()  # Cleanup on failure
+        raise e
 
 def allowed_file(filename):
     """Check if file extension is allowed with proper validation"""
@@ -102,10 +122,19 @@ def handle_error(error_msg, status_code=500, details=None):
     
     return jsonify(response), status_code
 
-# Initialize on startup
+def ensure_directories():
+    """Ensure upload and output directories exist"""
+    try:
+        Path(app.config['UPLOAD_FOLDER']).mkdir(exist_ok=True)
+        Path(app.config['OUTPUT_FOLDER']).mkdir(exist_ok=True)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to create directories: {e}")
+        return False
+
+# Initialize directories on startup
 with app.app_context():
     ensure_directories()
-    init_processor()
 
 @app.errorhandler(RequestEntityTooLarge)
 def handle_file_too_large(e):
@@ -125,9 +154,13 @@ def handle_internal_error(e):
 # API Routes
 @app.route('/')
 def index():
-    """Serve the main dashboard page"""
+    """Serve the main dashboard page with caching"""
     try:
-        return render_template('index.html')
+        response = app.make_response(render_template('index.html'))
+        # Add caching headers for better performance
+        response.headers['Cache-Control'] = 'public, max-age=3600'  # 1 hour cache
+        response.headers['ETag'] = 'dashboard-v1'
+        return response
     except Exception as e:
         return handle_error("Failed to load dashboard", 500, e)
 
@@ -135,10 +168,8 @@ def index():
 def health_check():
     """Health check endpoint with system status"""
     try:
-        if not init_processor():
-            return handle_error("PDF processor not available", 503)
-        
-        status = processor.get_system_status()
+        proc = get_processor()
+        status = proc.get_system_status()
         return jsonify({
             'success': True,
             'status': 'healthy',
@@ -152,8 +183,7 @@ def health_check():
 def upload_file():
     """Handle single file upload and processing"""
     try:
-        if not init_processor():
-            return handle_error("PDF processor not available", 503)
+        proc = get_processor()
         
         if 'file' not in request.files:
             return handle_error("No file uploaded", 400)
@@ -168,31 +198,27 @@ def upload_file():
         # Get processing options
         use_ocr = request.form.get('use_ocr', 'false').lower() == 'true'
         
-        # Save uploaded file
-        filename = secure_filename(file.filename)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_filename = f"{timestamp}_{filename}"
-        file_path = Path(app.config['UPLOAD_FOLDER']) / unique_filename
-        
-        file.save(str(file_path))
-        logger.info(f"File uploaded: {filename}")
+        # Save uploaded file efficiently
+        file_path = secure_save_file(file, app.config['UPLOAD_FOLDER'])
+        logger.info(f"File uploaded: {file.filename}")
         
         # Process the file
-        result = processor.process_file(file_path, use_ocr=use_ocr)
+        result = proc.process_file(file_path, use_ocr=use_ocr)
         
         # Save result to output file if successful
         output_filename = None
         if result['success']:
             try:
                 # Generate output filename
-                base_name = Path(filename).stem
+                base_name = Path(file.filename).stem
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 output_filename = f"{base_name}_{timestamp}.txt"
                 output_path = Path(app.config['OUTPUT_FOLDER']) / output_filename
                 
                 # Save extracted text
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(f"PDF Text Extraction Results\n")
-                    f.write(f"Source: {filename}\n")
+                    f.write(f"Source: {file.filename}\n")
                     f.write(f"Extraction Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                     f.write(f"Processing Time: {result.get('processing_time', 0):.2f} seconds\n")
                     f.write(f"Characters: {result.get('char_count', 0)}\n")
@@ -210,7 +236,7 @@ def upload_file():
         
         # Clean up uploaded file
         try:
-            file_path.unlink()
+            Path(file_path).unlink()
         except Exception as cleanup_error:
             logger.warning(f"Failed to cleanup uploaded file: {cleanup_error}")
         
@@ -226,15 +252,13 @@ def upload_file():
     
     except Exception as e:
         logger.error(f"Upload error: {e}")
-        logger.error(traceback.format_exc())
         return handle_error("Upload processing failed", 500, e)
 
 @app.route('/api/batch-upload', methods=['POST'])
 def batch_upload():
     """Handle multiple file upload and processing"""
     try:
-        if not init_processor():
-            return handle_error("PDF processor not available", 503)
+        proc = get_processor()
         
         if 'files' not in request.files:
             return handle_error("No files uploaded", 400)
@@ -278,7 +302,7 @@ def batch_upload():
         
         # Process all files
         if file_paths:
-            batch_results = processor.process_multiple_files(file_paths, use_ocr=use_ocr)
+            batch_results = proc.process_multiple_files(file_paths, use_ocr=use_ocr)
             
             # Save results to output files
             for i, result in enumerate(batch_results):
@@ -424,21 +448,12 @@ def download_all():
     except Exception as e:
         return handle_error("ZIP download failed", 500, e)
 
-# Static file serving
-@app.route('/style.css')
-def serve_css():
-    """Serve CSS file"""
-    return send_from_directory('.', 'style.css')
-
-@app.route('/script.js')
-def serve_js():
-    """Serve JavaScript file"""
-    return send_from_directory('.', 'script.js')
-
 if __name__ == '__main__':
     try:
         logger.info("Starting Flask application...")
-        app.run(host='0.0.0.0', port=5000, debug=True)
+        # Production optimizations
+        debug_mode = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
+        app.run(host='0.0.0.0', port=5000, debug=debug_mode, threaded=True)
     except Exception as e:
         logger.error(f"Failed to start application: {e}")
         sys.exit(1)
